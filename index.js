@@ -1,5 +1,5 @@
-const {ArgumentParser} = require('argparse');
-const dotenv = require('dotenv');
+// const {ArgumentParser} = require('argparse');
+// const dotenv = require('dotenv');
 const mysqlPromise = require('mysql2/promise');
 const fs = require('fs');
 const { Toolkit } = require("actions-toolkit");

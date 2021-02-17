@@ -1,0 +1,13 @@
+name: "Sync Devops"
+author: "Oliver Pike"
+description: "Perform a sync with the devops db"
+inputs:
+  token:
+    description: "Github Token"
+    required: true
+outputs:
+  some-output:
+    description: "heroku review app host from a PR label"
+runs:
+  using: "node12"
+  main: "./dist/index.js"

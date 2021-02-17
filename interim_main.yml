@@ -1,0 +1,368 @@
+name: Interim-Main
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches:
+      - master
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+env:
+  TEST_TARGET_ENV: "production"
+  BUILD_TARGET_ENV: "production"
+  CYPRESS_PERCY_ENV: "test"
+  DB_PREFIX: "test-ci"
+  PERCY_TEST: ${{ secrets.PERCY_TEST }}
+  PERCY_TEST_SMALL: ${{ secrets.PERCY_TEST_SMALL }}
+  CYPRESS_TEST_ID: ${{ secrets.CYPRESS_TEST_ID }}
+  CYPRESS_TEST_RECORD_KEY: ${{ secrets.CYPRESS_TEST_RECORD_KEY }}
+
+jobs:
+  check-running:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Turnstyle
+        # Note: This terminates the more recent run and allows the older
+        #       workflow to complete.
+        uses: softprops/turnstyle@v1
+        with:
+          same-branch-only: true
+          poll-interval-seconds: 20
+          abort-after-seconds: 60
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: opike/actions/checklabel@master
+        id: get-label
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          pr_number1: ${{ github.event.number }}
+          pr_number2: ${{ github.event.issue.number }}
+
+  branch-name:
+    runs-on: ubuntu-latest
+    needs: [ 'check-running' ]
+    outputs:
+      branch-name: ${{ env.BRANCH_NAME }}
+    steps:
+      - uses: actions/checkout@v2
+      - name: Get branch name (non pull request)
+        if: github.event_name != 'pull_request' && github.event_name != 'push'
+        shell: bash
+        run: echo "BRANCH_NAME=$(echo ${GITHUB_REF#refs/heads/} | tr / -)" >> $GITHUB_ENV
+      - name: Get branch name (pull request)
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        shell: bash
+        run: echo "BRANCH_NAME=$(echo ${GITHUB_HEAD_REF} | tr / -)" >> $GITHUB_ENV
+
+  start-workflow:
+    runs-on: ubuntu-latest
+    outputs:
+      ci-id: ${{ env.CI_ID }}
+      deploy-status: ${{ env.DEPLOY_STATUS }}
+      heroku-app: ${{ env.HEROKU_APP }}
+    needs: [ 'branch-name' ]
+    steps:
+     - name: Checkout
+       uses: actions/checkout@v2
+     - name: removelabel
+       uses: buildsville/add-remove-label@v1
+       with:
+         token: ${{ secrets.GITHUB_TOKEN }}
+         label: 'review-app'
+         type: remove
+     - name: Cache node_modules
+       uses: actions/cache@v2
+       with:
+         path: ~/.npm
+         key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+         restore-keys: |
+           ${{ runner.os }}-node-
+     - uses: actions/setup-node@v1
+       with:
+         node-version: 12.18.1
+     - name: Run npm
+       run: |
+         npm ci --no-optional
+     - name: Insert build info
+       env:
+         DBHOST_PROXY: 'devops'
+         DB_CLIENT_EMAIL: ${{ secrets.DB_CLIENT_EMAIL }}
+         DB_CLIENT_ID: ${{ secrets.DB_CLIENT_ID }}
+         DB_CLIENT_X509_CERT_URL: ${{ secrets.DB_CLIENT_X509_CERT_URL }}
+         DB_PRIVATE_KEY: ${{ secrets.DB_PRIVATE_KEY }}
+         DB_PRIVATE_KEY_ID: ${{ secrets.DB_PRIVATE_KEY_ID }}
+         # TODO: Setting dyno so that the sed commands work but we should flip
+         #       the conditional logic around to check for Mac.
+         DYNO: 'something'
+         DBUSER: 'standard1'
+         # TODO: Need to restructure the db password handling for the devops db
+         DBPASSWORD: 'aCRgXh3@q!RZcnCu1Bx4'
+         BRANCH_NAME: ${{ needs.branch-name.outputs.branch-name }}
+       run: |
+         ./.profile
+         npm run build:update -- -o insert -b ${{ needs.branch-name.outputs.branch-name }}
+         echo "CI_ID=$(cat ci_id.txt)" >> $GITHUB_ENV
+         echo "DEPLOY_STATUS=$(cat deploy_status.txt)" >> $GITHUB_ENV
+         echo "HEROKU_APP=$(cat heroku_app.txt)" >> $GITHUB_ENV
+
+  eslint:
+    runs-on: ubuntu-latest
+    needs: [ 'check-running' ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Cache node_modules
+        uses: actions/cache@v2
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      - uses: actions/setup-node@v1
+        with:
+          node-version: 12.18.1
+      - name: Install Npm
+        run: |
+          npm ci --no-optional
+      - name: eslint
+        run: |
+          npm run lint
+
+  jest-unit:
+    runs-on: ubuntu-latest
+    needs: [ 'check-running' ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Cache node_modules
+        uses: actions/cache@v2
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      - uses: actions/setup-node@v1
+        with:
+          node-version: 12.18.1
+      - name: Install Npm
+        run: |
+          npm ci --no-optional
+      - name: unit test with jest
+        run: |
+          npm run unit
+
+  clone-db:
+    runs-on: ubuntu-latest
+    needs: [ 'branch-name', 'start-workflow' ]
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      # Using @master here since they aren't offering proper version tags.
+      - uses: google-github-actions/setup-gcloud@master
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          export_default_credentials: false
+      - name: Use gcloud CLI
+        run: |
+          echo ${{ needs.start-workflow.outputs.ci-id }}
+          gcloud info
+      - name: Clone db
+        run: |
+          gcloud sql instances clone test-clone-source $DB_PREFIX-${{ needs.start-workflow.outputs.ci-id }}
+
+  deploy-review-app:
+    runs-on: ubuntu-latest
+    needs: [ 'start-workflow' ]
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_PA_TOKEN: ${{ secrets.GH_PA_TOKEN }}
+      HEROKU_API_TOKEN: ${{ secrets.HEROKU_API_KEY }}
+      HEROKU_PIPELINE_ID: ${{ secrets.HEROKU_PIPELINE_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Debug
+        run: |
+          pwd
+      - name: Deploy Heroku review app
+        uses: opike/actions/.github/actions/deploy-heroku-review-app@master
+        if: github.event_name == 'pull_request'
+
+  review-app-test:
+    runs-on: ubuntu-latest
+    needs: [ 'deploy-review-app', 'start-workflow' ]
+    outputs:
+      output: ${{ steps.review_app_test.outputs.review_app_name }}
+    steps:
+      - name: Placeholder
+        run: |
+          pwd
+      - name: Run review-app test with deploy
+        id: review_app_test  # `id` value is used to refer the outputs from the corresponding action
+        uses: niteoweb/reviewapps-deploy-status@v1.4.0
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Checks to be performed, default is all the checks
+          checks: build, response
+
+          # Delay for the application to be built in Heroku, default is 5 seconds
+          build_time_delay: 200
+
+          # Delay for the application to load and start serving, default is 5 seconds
+          load_time_delay: 5
+
+          # Interval for the repeating checks, default is 10 seconds
+          interval: 10
+
+          # Acceptable responses for the response check, default is 200
+          accepted_responses: 200
+
+          # Max time to be spent retrying for the build check, default is 120
+          deployments_timeout: 500
+
+          # Max time to be spent retrying for the response check, default is 120
+          publish_timeout: 120
+
+  update-config-var:
+    runs-on: ubuntu-latest
+    needs: [ 'review-app-test', 'clone-db', 'start-workflow' ]
+    outputs:
+      output: ${{ env.HEROKU_APP }}
+    steps:
+      - name: New Deployment
+        if: needs.start-workflow.outputs.deploy-status == 'new'
+        env:
+          HEROKU_OUTPUT: ${{ needs.review-app-test.outputs.output }}
+        run: |
+          echo $HEROKU_OUTPUT
+          echo "HEROKU_APP=$(echo $HEROKU_OUTPUT)" >> $GITHUB_ENV
+      # Note: for an existing deployment, we are pulling the heroku app name
+      #       name from the database, not from niteoweb/reviewapps-deploy-status
+      #       So we are relying on the fact that opike/github-action-pr-heroku-review-app
+      #       will deploy into the same review app as the original deployment.
+      - name: Existing Deployment
+        if: needs.start-workflow.outputs.deploy-status != 'new'
+        env:
+          HEROKU_OUTPUT: ${{ needs.start-workflow.outputs.heroku-app }}
+        run: |
+          echo $HEROKU_OUTPUT
+          echo "HEROKU_APP=$(echo $HEROKU_OUTPUT)" >> $GITHUB_ENV
+      - name: Update DBHOST_PROXY on Heroku
+        run: |
+          heroku config:set DBHOST_PROXY=${{ env.DBHOST_PROXY }} -a ${{ env.HEROKU_APP }}
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          DBHOST_PROXY: $DB_PREFIX-${{ needs.start-workflow.outputs.ci-id }}
+
+  update-workflow:
+    runs-on: ubuntu-latest
+    needs: [ 'update-config-var', 'start-workflow' ]
+    if: needs.start-workflow.outputs.deploy-status == 'new'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: removelabel
+        # Remove the label that was assigned by opike/github-action-pr-heroku-review-app
+        # TODO: Remove the label assignment code from the above github action.
+        uses: buildsville/add-remove-label@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          label: 'review-app'
+          type: remove
+      - name: Cache node_modules
+        uses: actions/cache@v2
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      - uses: actions/setup-node@v1
+        with:
+          node-version: 12.18.1
+      - name: Run npm
+        run: |
+          npm ci --no-optional
+      - name: Insert build info
+        env:
+          DBHOST_PROXY: 'devops'
+          DB_CLIENT_EMAIL: ${{ secrets.DB_CLIENT_EMAIL }}
+          DB_CLIENT_ID: ${{ secrets.DB_CLIENT_ID }}
+          DB_CLIENT_X509_CERT_URL: ${{ secrets.DB_CLIENT_X509_CERT_URL }}
+          DB_PRIVATE_KEY: ${{ secrets.DB_PRIVATE_KEY }}
+          DB_PRIVATE_KEY_ID: ${{ secrets.DB_PRIVATE_KEY_ID }}
+          DYNO: 'something'
+          DBUSER: 'standard1'
+          DBPASSWORD: 'aCRgXh3@q!RZcnCu1Bx4'
+          BRANCH_NAME: ${{ needs.branch-name.outputs.branch-name }}
+        run: |
+          ./.profile
+          npm run build:update -- -o update -c ${{ needs.start-workflow.outputs.ci-id }} -ha ${{ needs.update-config-var.outputs.output }} -d $DB_PREFIX-${{ needs.start-workflow.outputs.ci-id }}
+          echo "CI_ID=$(cat ci_id.txt)" >> $GITHUB_ENV
+          echo "DEPLOY_STATUS=$(cat deploy_status.txt)" >> $GITHUB_ENV
+          echo "HEROKU_APP=$(cat heroku_app.txt)" >> $GITHUB_ENV
+
+  scrub-app:
+    runs-on: ubuntu-latest
+    needs: ['update-config-var']
+    outputs:
+      output: ${{ needs.update-config-var.outputs.output }}
+    continue-on-error: true
+    steps:
+      - uses: actions/setup-python@v2
+        # TODO: Make the version consistent across the app.
+        with:
+          python-version: 3.7.5
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: run pip3
+        run: |
+          pip3 install -r requirements/development.txt
+      - name: scrub
+        env:
+          HOST_OVERRIDE: ${{ format('{0}.herokuapp.com', needs.update-config-var.outputs.output) }}
+        run: |
+          python3 -m test.main_clean_up -host $HOST_OVERRIDE
+
+  test-percy:
+    runs-on: ubuntu-latest
+    needs: ['scrub-app']
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        size: [large, small]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - uses: actions/setup-node@v1
+        with:
+          node-version: 12.18.1
+      # Caching and npm install are handled by the cypress action.
+      - name: Custom tests 🧪
+        env:
+          HEROKU_APP_NAME: ${{ needs.scrub-app.outputs.output }}
+        uses: cypress-io/github-action@v2
+        with:
+          command: npm run percy -- -s ${{ matrix.size }} -e $CYPRESS_PERCY_ENV
+          cache-key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+      - name: Log content
+        if: ${{ failure() }}
+        run: |
+          ls -latd logs/
+          cat logs/out.txt
+          cat logs/out.json
+      - name: Archive production artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v2
+        with:
+          name: cypress-logs
+          path: |
+            logs/out.txt
+            logs/out.json

@@ -1,157 +1,130 @@
+// const {ArgumentParser} = require('argparse');
+// const dotenv = require('dotenv');
+const mysqlPromise = require('mysql2/promise');
+const fs = require('fs');
 const { Toolkit } = require("actions-toolkit");
 
-const Heroku = require("heroku-client");
-const heroku = new Heroku({ token: process.env.HEROKU_API_TOKEN });
+// const Heroku = require("heroku-client");
+// const heroku = new Heroku({ token: process.env.HEROKU_API_TOKEN });
 
-// Run your GitHub Action!
+// Will load .env.local if exists, otherwise it will just load .env
+// dotenv.config({path: '.env.local'});
+// dotenv.config({path: '.env'});
+
+// const parser = new ArgumentParser({
+//   description: 'Argparse example'
+// });
+//
+// parser.add_argument('-b', '--branch');
+// parser.add_argument('-c', '--ciId');
+// parser.add_argument('-d', '--database');
+// parser.add_argument('-ha', '--herokuApp');
+// parser.add_argument('-o', '--operation');
+//
+// const args = parser.parse_args();
+
+// const dbUser = process.env.DBUSER;
+// const dbPassword = process.env.DBPASSWORD;
+// const dbHost = process.env.DBHOST;
+// const dbName = process.env.DATABASE;
+
+const dbUser = "set me";
+const dbPassword = "set me";
+const dbHost = "set me";
+const dbName = "set me";
+
+/**
+ * Run wrapper method
+ */
 Toolkit.run(
-  async (tools) => {
-    const pr = tools.context.payload.pull_request;
-
-    // Required information
-    const event = tools.context.event;
-    const branch = pr.head.ref;
-    const version = pr.head.sha;
-    const fork = pr.head.repo.fork;
-    const pr_number = pr.number;
-    const repo_url = pr.head.repo.html_url;
-    const repo_name = pr.head.repo.name;
-    const owner = pr.head.repo.owner.login;
-    // Note!! Make sure you use a personal access token and not the implicit
-    //        secrets.GITHUB_TOKEN
-    const github_pa_token = process.env.GITHUB_PA_TOKEN;
-
-    // This worked:
-    const source_url = `https://${owner}:${github_pa_token}@api.github.com/repos/${owner}/${repo_name}/tarball/${branch}`;
-
-    let fork_repo_id;
-    if (fork) {
-      fork_repo_id = pr.head.repo.id;
-    }
-
-    tools.log.debug("Deploy Info", {
-      branch,
-      version,
-      fork,
-      pr_number,
-      source_url,
-      repo_name,
-      owner
-    });
-
-    let action = tools.context.payload.action;
-
-    // We can delete a review app without them being a collaborator
-    // as the only people that can close PRs are maintainers or the author
-    if (action === "closed") {
-      // Fetch all PRs
-      tools.log.pending("Listing review apps");
-      const reviewApps = await heroku.get(
-        `/pipelines/${process.env.HEROKU_PIPELINE_ID}/review-apps`
-      );
-      tools.log.complete("Fetched review app list");
-
-      // Filter to the one for this PR
-      const app = reviewApps.find((app) => app.pr_number == pr_number);
-      if (!app) {
-        tools.log.info(`Could not find review app for PR number ${pr_number}`);
-        return;
-      }
-
-      // Delete the PR
-      tools.log.pending("Deleting review app");
-      await heroku.delete(`/review-apps/${app.id}`);
-      tools.log.complete("Review app deleted");
-      return;
-    }
-
-    // Do they have the required permissions?
-    let requiredCollaboratorPermission = process.env.COLLABORATOR_PERMISSION;
-    if (requiredCollaboratorPermission) {
-      requiredCollaboratorPermission = requiredCollaboratorPermission.split(
-        ","
-      );
-    } else {
-      requiredCollaboratorPermission = ["triage", "write", "maintain", "admin"];
-    }
-
-    const reviewAppLabelName =
-      process.env.REVIEW_APP_LABEL_NAME || "review-app";
-
-    const perms = await tools.github.repos.getCollaboratorPermissionLevel({
-      ...tools.context.repo,
-      username: tools.context.actor,
-    });
-
-    if (!requiredCollaboratorPermission.includes(perms.data.permission)) {
-      tools.exit.success("User is not a collaborator. Skipping");
-    }
-
-    tools.log.info(`User is a collaborator: ${perms.data.permission}`);
-
-    let createReviewApp = false;
-
-    if (["opened", "reopened", "synchronize"].indexOf(action) !== -1) {
-      tools.log.info("PR opened by collaborator");
-      createReviewApp = true;
-      await tools.github.issues.addLabels({
-        ...tools.context.repo,
-        labels: ["review-app"],
-        issue_number: pr_number,
+  async(tools) => {
+    let connection = null;
+    try {
+      // Create a promise capable database connection.
+      connection = await mysqlPromise.createConnection({
+        host: dbHost,
+        user: dbUser,
+        password: dbPassword,
+        database: dbName,
+        connectTimeout: 60000
       });
-    } else if (action === "labeled") {
-      const labelName = tools.context.payload.label.name;
-      tools.log.info(`${labelName} label was added by collaborator`);
 
-      if (labelName === reviewAppLabelName) {
-        createReviewApp = true;
-      } else {
-        tools.log.debug(`Unexpected label, not creating app: ${labelName}`);
-      }
-    }
+      tools.log.info('HERE AAA');
 
-    if (createReviewApp) {
-      // If it's a fork, creating the review app will fail as there are no secrets available
-      if (fork && event == "pull_request") {
-        tools.log.pending("Fork detected. Exiting");
-        tools.log.pending(
-          "If you would like to support PRs from forks, use the pull_request_target event"
-        );
-        tools.log.success("Action complete");
-        return;
-      }
+      if (args.operation.toUpperCase() === 'INSERT') {
+        let insertId = null;
+        let status = 'new';
+        let herokuAppName = null;
+        let readQuery = `SELECT * FROM workflows WHERE branch="${args.branch}"`;
 
-      // Otherwise we can complete it in this run
-      try {
-        tools.log.pending("Creating review app");
-        const resp = await heroku.request({
-          path: "/review-apps",
-          method: "POST",
-          body: {
-            branch,
-            pipeline: process.env.HEROKU_PIPELINE_ID,
-            source_blob: {
-              url: source_url,
-              version,
-            },
-            fork_repo_id,
-            pr_number,
-            environment: {
-              GIT_REPO_URL: repo_url,
-            }
+        const [readResponse] = await connection.execute(readQuery);
+
+        if (readResponse.length === 0) {
+          console.log('Branch name not found, creating new ci entry.');
+          const query =
+              `INSERT INTO workflows
+       (branch)
+       VALUES ("${args.branch}")`;
+
+          const [response] = await connection.execute(query);
+
+          insertId = response.insertId;
+        } else {
+          insertId = readResponse[0].id;
+          herokuAppName = readResponse[0].heroku_app;
+          // It's possible that we created the db record but failed prior to
+          // deploying heroku.
+          if (herokuAppName) {
+            status = 'existing';
+          }
+          console.log(`ci id ${insertId} found for branch ${args.branch}`);
+        }
+
+        await fs.writeFile('ci_id.txt', insertId, 'utf8', (err) => {
+          if (err) {
+            return console.log(err);
           }
         });
-        tools.log.complete("Created review app");
-      } catch (e) {
-        // A 409 is a conflict, which means the app already exists
-        if (e.statusCode !== 409) {
-          throw e;
+
+        await fs.writeFile('deploy_status.txt', status, 'utf8', (err) => {
+          if (err) {
+            return console.log(err);
+          }
+        });
+
+        await fs.writeFile('heroku_app.txt', herokuAppName, 'utf8', (err) => {
+          if (err) {
+            return console.log(err);
+          }
+        });
+      } else {
+        let readQuery = `SELECT * FROM workflows WHERE id=${args.ciId}`;
+
+        const [readResponse] = await connection.execute(readQuery);
+
+        if (readResponse.length === 1) {
+          const query =
+              `UPDATE workflows 
+          SET heroku_app="${args.herokuApp}", database_name="${args.database}"
+          WHERE id=${args.ciId}`;
+
+          console.log(query);
+
+          const [updateResponse] = await connection.execute(query);
+          console.log(updateResponse);
+        } else {
+          console.log(`Issue finding workflow ${args.ciId}`);
+          throw new Error('invalid update');
         }
-        tools.log.complete("Review app is already created");
+      }
+      tools.log.success("Action complete");
+    } catch (error) {
+      console.log(error);
+    } finally {
+      if (connection) {
+        connection.end();
       }
     }
-
-    tools.log.success("Action complete");
   },
   {
     event: [
@@ -160,12 +133,9 @@ Toolkit.run(
       "pull_request.synchronize",
       "pull_request.labeled",
       "pull_request.closed",
-      "pull_request_target.opened",
-      "pull_request_target.reopened",
-      "pull_request_target.synchronize",
-      "pull_request_target.labeled",
-      "pull_request_target.closed",
+      "workflow_dispatch"
     ],
-    secrets: ["GITHUB_TOKEN", "GITHUB_PA_TOKEN", "HEROKU_API_TOKEN", "HEROKU_PIPELINE_ID"],
+    secrets: ["GITHUB_TOKEN"]
   }
 );
+
